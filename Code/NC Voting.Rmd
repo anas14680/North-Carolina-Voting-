@@ -1,0 +1,436 @@
+---
+title: "IDS 702 Team Project 2: StreetRx and Voting in NC"
+date: "10/25/2021"
+output:
+  pdf_document: default
+geometry: margin=0.5in
+---
+
+
+
+## __Summary__
+This analysis is to investigate the potential factors, especially the demographic ones, that affect the turnout rates of the US 2020 General elections in North Carolina. During the process, data cleaning, aggregation, and merging have been performed to combine the registered voters information with the actual voter turnouts. Exploratory data analysis was then performed and the effects of demographic factors on the actual turnouts were examined. The finalized hierarchical model helps us dive into how demographics like age impact the turnout rates in the election, and serves to provide a possible explanation as to why the Republicans outperform the Democrats in certain counties. 
+
+## __Introduction__
+It is widely acknowledged that the voting behaviors in the election are related to several factors, e.g., demographic factors, location, or the party you are affiliated to. This analysis constructs a hierarchical model to answer the following questions:
+
+- How did different demographic subgroups vote in the 2020 general elections?
+- Did the odds of voting differ by county? Which counties differ the most?
+- How did the turnout rate differ between males and females for different parties?
+- How did the turnout rate differ among age groups for different parties?
+
+## __Data__
+
+### Data Pre-Processing
+
+The data used for this analysis was extracted from two files available with The North Carolina State Board of Elections (NCSBE), which is the agency charged with the administration of the elections process and campaign finance disclosure and compliance. One file contains the voter registration records, while the other contains data on the actual turnout (<https://www.ncsbe.gov/index.html>, <https://www.ncsbe.gov/results-data>). The code book can be found in the appendix.
+
+The unit of observation in the registered voters file is $county\_desc$, $precinct\_abbrv$, $vtd\_abbrv$, $party\_cd$, $race\_code$, $ethnic\_code$, $sex\_code$ and $age$. The turnouts file had data at a more granular level ($voting\_method$), and it was aggregated to match the unit of observation in the registered voter file. The registered voters file had 592,265 observations, while the turnouts file had 928,532 observations. Post aggregation of the turnouts file, there were 492,567 observations remaining. The actual turnout numbers were then merged with the total voter file to create a model ready dataset. The dataset was further reduced to a sample of 25 counties, post which we were left with 13,162 observations, grouped at a $county\_desc$, $party\_cd$, $race\_code$, $ethnic\_code$, $sex\_code$ and $age$ level, with the total number of registered voters and turnouts in demographic groups represented by these characteristics.
+
+```{r echo=FALSE,  message=FALSE, warning=FALSE, results='asis'}
+# Reading in libraries
+library(ggplot2)
+library(rms)
+library(arm)
+library(e1071)
+library(caret)
+library(pROC)
+library(ggdark)
+library(ggeasy)
+library(tidyverse)
+library(viridis)
+library(sjPlot)
+library(xtable)
+library(stargazer)
+```
+
+```{r echo=FALSE,  message=FALSE, warning=FALSE, results='asis', include=FALSE}
+# Reading in datasets
+# voter <- read.csv("C:/Users/sdona/Documents/Duke/702IDS/TeamProjects/02Project/Q2/voter_stats_20201103.txt", header=TRUE, sep='\t')
+# history <- read.csv("C:/Users/sdona/Documents/Duke/702IDS/TeamProjects/02Project/Q2/history_stats_20201103.txt", header=TRUE, sep='\t')
+
+voter <- read.csv("/Users/mohammadanas/Desktop/Raw data_part_1_2/voter_stats_20201103.txt", header=TRUE, sep='\t')
+history <- read.csv("/Users/mohammadanas/Desktop/Raw data_part_1_2/history_stats_20201103.txt", header=TRUE, sep='\t')
+
+
+# Preliminary check of the datasets
+head(voter)
+summary(voter)
+str(voter)
+
+head(history)
+summary(history)
+str(history)
+
+# Dropping unwanted columns from both datasets
+drop <- c("election_date","stats_type","update_date")
+voter <- voter[, !names(voter) %in% drop]
+history <- history[, !names(history) %in% drop]
+
+# Aggregating the history dataset to match the level
+# (of uniqueness of obs) of the voter dataset
+agg_history <- aggregate(list(turnout=history$total_voters),
+                         list(county_desc=history$county_desc,
+                              party_cd=history$voted_party_cd,
+                              age=history$age, race_code=history$race_code,
+                              ethnic_code=history$ethnic_code,
+                              sex_code=history$sex_code,
+                              precinct_abbrv=history$precinct_abbrv,
+                              vtd_abbrv=history$vtd_abbrv), sum)
+
+# Merging the two datasets on the following cols:
+# county_desc,	precinct_abbrv,	vtd_abbrv,	party_cd,
+# race_code,	ethnic_code,	sex_code,	age
+merged <- left_join(voter, agg_history, by = NULL, copy = FALSE)
+
+# Replacing nulls in turnout by zeroes
+merged$turnout[is.na(merged$turnout)] <- 0
+
+# quick QC on the voter numbers before and after merge --> match!
+agg_voter <- aggregate(voter$total_voters,
+                       list(Age=voter$age,Party=voter$party_cd),sum)
+agg_data <- aggregate(merged$total_voters,
+                      list(Age=merged$age,Party=merged$party_cd),sum)
+
+# Checking the proportion of voters who turned up to vote --> ~75%
+sum(merged$turnout)/sum(merged$total_voters)
+
+# Taking a sample of 25 counties from the entire dataset
+# and filtering dataset on those counties
+set.seed(123) #set your own seed to be able to replicate results
+all_counties <- unique(merged[c("county_desc")])
+county_sample <- c(sample(all_counties$county_desc,size=25,replace=F))
+voters_reduced <- merged[is.element(merged$county_desc,county_sample),]
+
+voters_reduced_agg <- aggregate(list(total_voters = voters_reduced$total_voters
+                             ,turnout = voters_reduced$turnout
+                            ),
+                        by=list(county_desc=voters_reduced$county_desc,
+                                     party_cd=voters_reduced$party_cd,
+                                     age=voters_reduced$age,
+                                     race_code=voters_reduced$race_code,
+                                     ethnic_code=voters_reduced$ethnic_code,
+                                     sex_code=voters_reduced$sex_code
+                                     ),FUN=sum)
+
+voters_reduced_agg$county_desc <- factor(voters_reduced_agg$county_desc)
+voters_reduced_agg$party_cd <- factor(voters_reduced_agg$party_cd)
+voters_reduced_agg$age <- factor(voters_reduced_agg$age)
+voters_reduced_agg$race_code <- factor(voters_reduced_agg$race_code)
+voters_reduced_agg$ethnic_code <- factor(voters_reduced_agg$ethnic_code)
+voters_reduced_agg$sex_code <- factor(voters_reduced_agg$sex_code)
+voters_reduced_agg$turnout <- as.integer(voters_reduced_agg$turnout)
+
+# voters_reduced_agg$temp <- voters_reduced_agg$turnout
+# voters_reduced_agg$temp[voters_reduced_agg$temp > voters_reduced_agg$total_voters] <- voters_reduced_agg$total_voters
+
+
+voters_reduced_agg$turnout_rate <- voters_reduced_agg$turnout/voters_reduced_agg$total_voters
+voters_reduced_agg$turnout_rate[voters_reduced_agg$turnout_rate > 1] <- 1
+voters_reduced_agg$newcol <- voters_reduced_agg$turnout_rate * voters_reduced_agg$total_voters
+voters_reduced_agg = subset(voters_reduced_agg, select = -c(turnout))
+names(voters_reduced_agg)[names(voters_reduced_agg)=="newcol"] <- "turnout"
+
+str(voters_reduced_agg)
+unique(voters_reduced_agg$party_cd)
+unique(voters_reduced_agg$race_code)
+unique(voters_reduced_agg$age)
+
+# The unique counties in our dataset are:
+# CUMBERLAND   LEE          ORANGE       UNION        WATAUGA      CABARRUS     HARNETT      NEW HANOVER 
+# SCOTLAND     DAVIDSON     HAYWOOD      PERSON       ROWAN        WILSON       COLUMBUS     NORTHAMPTON 
+# PENDER       TYRRELL      ALEXANDER    WARREN       POLK         GATES        MACON        TRANSYLVANIA
+# HYDE
+```
+
+## __EDA__
+
+Our EDA is split into 4 different sections.  First, we will look at a plot of our hierarchy, county, to determine if it has varying intercept or varying slope.  Second, we will look at our main effects, which are all factor variables in our data, so we will only look at boxplots.  Third, we will look at all of the interactions with our main effects, again by analyzing boxplots.  Finally, we will look at the interactions between our main effects and our set hierarchy to see if we need to control for varying slope.
+
+When we look at county, the hierarchy in our data, it clearly varies from county to county. Alexander, Haywood and Hyde have high voter turnout compared to Columbus, Cumberland, Scotland and Wilson.  Therefore, we will move forward knowing that we need to include varying intercept in our model building. Next, when we look at our main effects, we can pull some basic information from the boxplots. For example, older age groups coming out to vote more than younger age groups, or that most people choose not disclose their sex when registering to vote.
+
+```{r echo=FALSE,  message=FALSE, warning=FALSE, results='asis', fig.height=4.5, fig.width=8}
+################## varying intercept ##########################
+# Plot county vs turnout 
+ggplot(voters_reduced_agg,aes(x=county_desc, y=turnout_rate, fill=county_desc)) +
+  geom_boxplot() +
+  scale_fill_viridis(discrete = TRUE) + labs(title="Turnout Rate vs Counties", x="Counties",y="Turnout Rate") + 
+  theme_classic() + theme(legend.position="none", plot.title = element_text(hjust = 0.5,size=10),axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+
+When we go through all of the interactions of our main effects, we have to consider both the trends in the boxplots as well as the number of observations.  This is because a changing trend from one category to the next could be due to a lack of observations rather than an interesting interaction taking place.  One example of this is the race of P (Pacific Islander).  We sometimes have zero observations of this race when we split it up into different categories, so we have to look at changing trends without consideration for it. This becomes complicated when we also want to look at the interaction between race and party because there are two parties with far fewer observations: CST and GRE. Now we have three different categories that we should *not* take into consideration when looking at trends. Due to these limitations, we decided not to include the interaction between race and party in our model building. On the other hand, there are two interactions of high importance to us: age versus party and sex versus party.  These are questions of interest, so regardless of what kind of trend we see, we must include them when model building. We did see that there was a higher median for republicans of ages 26-40 as compared to democrats of the same age group, so we will keep that in mind moving forward.
+
+```{r echo=FALSE,  message=FALSE, warning=FALSE, results='asis',fig.height=3.5, fig.width=3.5}
+# # frequencies for race vs party 
+print(xtable(table(voters_reduced_agg$race_code, voters_reduced_agg$party_cd)), comment = FALSE)
+# ################## main effects ##########################
+# # Plot party vs turnout 
+# ggplot(voters_reduced_agg,aes(x=party_cd, y=turnout_rate, fill=party_cd)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Party Affiliation",
+#        x="Party Affiliation",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none")
+# 
+# # Plot age group vs turnout 
+# ggplot(voters_reduced_agg,aes(x=age, y=turnout_rate, fill=age)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Age",
+#        x="Age",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none")
+# 
+# # Plot race vs turnout 
+# ggplot(voters_reduced_agg,aes(x=race_code, y=turnout_rate, fill=race_code)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Race",
+#        x="Race",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none")
+# 
+# # Plot ethnicity vs turnout 
+# ggplot(voters_reduced_agg,aes(x=ethnic_code, y=turnout_rate, fill=ethnic_code)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Ethnicity",
+#        x="Ethnicity",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none")
+# 
+# # Plot sex vs turnout
+# ggplot(voters_reduced_agg,aes(x=sex_code, y=turnout_rate, fill=sex_code)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Sex",
+#        x="Sex",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none")
+
+
+##################### interactions #####################################
+# Plot sex vs turnout by party- MAYBE INCLUDE
+# ggplot(voters_reduced_agg,aes(x=sex_code, y=turnout_rate, fill=sex_code)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Sex by Party Affiliation",
+#        x="Sex",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none", plot.title = element_text(hjust = 0.5,size=10)) +
+#   facet_wrap(~party_cd, ncol=3)
+# 
+# # Plot sex vs turnout by age
+# ggplot(voters_reduced_agg,aes(x=sex_code, y=turnout_rate, fill=sex_code)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Sex by Age group",
+#        x="Sex",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none") +
+#   facet_wrap(~age, ncol=4)
+# 
+# # Plot sex vs turnout by race
+# ggplot(voters_reduced_agg,aes(x=sex_code, y=turnout_rate, fill=sex_code)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Sex by Race",
+#        x="Sex",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none") +
+#   facet_wrap(~race_code, ncol=4)
+# 
+# # Plot sex vs turnout by ethnicity
+# ggplot(voters_reduced_agg,aes(x=sex_code, y=turnout_rate, fill=sex_code)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Sex by Ethnicity",
+#        x="Sex",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none") +
+#   facet_wrap(~ethnic_code, ncol=3)
+#
+# # Plot age vs turnout by party- MAYBE INCLUDE
+# ggplot(voters_reduced_agg,aes(x=age, y=turnout_rate, fill=age)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Age group by Party Affiliation",
+#        x="Age Group",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none", plot.title = element_text(hjust = 0.5,size=10),axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+#   facet_wrap(~party_cd)
+#
+# 
+# # Plot race vs turnout by party
+# ggplot(voters_reduced_agg,aes(x=race_code, y=turnout_rate, fill=race_code)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Race by Party Affiliation",
+#        x="Race",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none") +
+#   facet_wrap(~party_cd, ncol=3)
+
+
+```
+
+Finally, we looked at interactions of our main effects and county.  We did not find the interaction between county and age or the interaction between county and ethnicity to be as interesting because the trend only changed in 8 or 9 counties out of all 25. When we look at interactions with race and party, we must still keep in mind the low count of observations for some categories. If we do not consider race P when analyzing our race interaction, the trend changes from one county to the next.  We also saw the trend continually changing in the interaction between party and county, even when we did not take the CST or GRE parties into consideration. So now we have two interactions with county that we found interesting: race and county and party and county.  Even though both of these interactions are interesting, we had to choose only one we wanted to focus on so that we could interpret our final model. We made the decision that we should control the random slope for county versus party, and we will further discuss this in our model building section.
+
+```{r echo=FALSE,  message=FALSE, warning=FALSE, results='asis',fig.height=5, fig.width=8}
+################## random slope ##############################
+# Plot age vs turnout by county
+# ggplot(voters_reduced_agg,aes(x=age, y=turnout_rate, fill=age)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Age by County",
+#        x="Age",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none") +
+#   facet_wrap(~county_desc, ncol=5)
+
+# Plot party vs turnout by county
+ggplot(voters_reduced_agg,aes(x=party_cd, y=turnout_rate, fill=party_cd)) +
+  geom_boxplot() + #coord_flip() +
+  # scale_fill_brewer(palette="Greens") +
+  scale_fill_viridis(discrete = TRUE) +
+  labs(title="Turnout Rate vs Party Affiliation by County",
+       x="Party Affiliation",y="Turnout Rate") + 
+  theme_classic() + theme(legend.position="none", 
+  plot.title = element_text(hjust = 0.5,size=10),
+  axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  facet_wrap(~county_desc, ncol=5)
+
+# Plot race vs turnout by county
+# ggplot(voters_reduced_agg,aes(x=race_code, y=turnout_rate, fill=race_code)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Race by County",
+#        x="Race",y="Turnout Rate") +
+#   theme_classic() + theme(legend.position="none", plot.title = element_text(hjust = 0.5,size=10),axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + facet_wrap(~county_desc, ncol=5)
+#
+# # Plot ethinicity vs turnout by county
+# ggplot(voters_reduced_agg,aes(x=ethnic_code, y=turnout_rate, fill=ethnic_code)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Ethnicity by County",
+#        x="Ethnicity",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none") +
+#   facet_wrap(~county_desc, ncol=5)
+# 
+# # Plot sex vs turnout by county
+# ggplot(voters_reduced_agg,aes(x=sex_code, y=turnout_rate, fill=sex_code)) +
+#   geom_boxplot() + #coord_flip() +
+#   # scale_fill_brewer(palette="Greens") +
+#   scale_fill_viridis(discrete = TRUE) +
+#   labs(title="Turnout Rate vs Sex by County",
+#        x="Sex",y="Turnout Rate") + 
+#   theme_classic() + theme(legend.position="none") +
+#   facet_wrap(~county_desc, ncol=5)
+# 
+# 
+# # TODO
+# # frequencies for age vs party
+# table(voters_reduced_agg$age, voters_reduced_agg$party_cd)
+# 
+# # frequencies for age vs party
+# table(voters_reduced_agg$sex_code, voters_reduced_agg$party_cd)
+# 
+# # frequencies for sex vs race - observations against race "P" very few
+# table(voters_reduced_agg$sex_code, voters_reduced_agg$race_code)
+# 
+# # frequencies for sex vs ethnicity - very similar trends
+# table(voters_reduced_agg$sex_code, voters_reduced_agg$ethnic_code)
+# 
+# # frequencies for race vs county 
+# table(voters_reduced_agg$race_code, voters_reduced_agg$county_desc)
+# 
+# # frequencies for age vs county 
+# table(voters_reduced_agg$age, voters_reduced_agg$county_desc)
+# 
+# # frequencies for party vs county 
+# table(voters_reduced_agg$party_cd, voters_reduced_agg$county_desc)
+# 
+# # frequencies for ethnicity vs county 
+# table(voters_reduced_agg$ethnic_code, voters_reduced_agg$county_desc)
+
+```
+
+```{r echo=FALSE,  message=FALSE, warning=FALSE, results='asis', include=FALSE}
+# start_time <- Sys.time()
+# model1 <- glmer(cbind(turnout, total_voters-turnout) ~
+#                   age + party_cd + race_code + ethnic_code + sex_code +
+#                   age: party_cd + sex_code:party_cd + (1 | county_desc),
+#                 family=binomial, data=voters_reduced_agg, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+# end_time <- Sys.time()
+# print(paste("The model training time:" , end_time - start_time))
+# 
+# 
+# summary(model1)
+# tab_model(model1)
+# dotplot(ranef(model1, condVar=TRUE))
+```
+
+```{r echo=FALSE,  message=FALSE, warning=FALSE, results='asis'}
+#start_time <- Sys.time()
+model2 <- glmer(cbind(turnout, total_voters-turnout) ~
+                  age + party_cd + race_code + ethnic_code + sex_code +
+                  age: party_cd + sex_code:party_cd + (party_cd | county_desc),
+                family=binomial(link="logit"), data=voters_reduced_agg, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+#end_time <- Sys.time()
+#print(paste("The model training time:" , end_time - start_time))
+
+#summary(model2)
+#tab_model(model2)
+#dotplot(ranef(model2, condVar=TRUE))
+```
+## __Model__
+
+Model selection was performed by accounting for different interactions and effects, which included both random and fixed effects. Our main interactions of interest are analyzing how the turnouts differed by the sexes, and if party affiliations played a role. We are also interested in exploring by the turnouts differed for the age groups for different party affiliations.
+
+We fit a hierarchical model to explore the random effects that different counties may contribute to the model. Counties are used as the only hierarchy. In addition, random slopes for party affiliations were also considered. The model with random intercepts by county was then compared to the model with random slopes for party affiliations with an ANOVA Chi-squared test, and we observe that incorporating the random slope significantly improves model fit.
+
+The final model equation is as follows:
+
+$$ y_i|x_i \hspace {1mm}{\sim} \hspace {1mm} Bernoulli (\pi_i);\hspace {1mm} i = 1,2,\ldots, 13162; \hspace {1mm} j = 1,2, \ldots, 25 $$ 
+
+$$
+(\beta_0 + \gamma_{0j|i|}) +  \beta_1 * x_{i1} + \beta_2*x_{i2} + \beta_3*x_{i3} + \beta_4*x_{i4} + \beta_5*x_{i5} + \beta_6*x_{i6} + (\beta_7 + \gamma_{1j|i|}) x_{i7};
+$$
+where, $x_{i1}$ is $age$, $x_{i2}$ is $race\_code$, $x_{i3}$ is $ethnic\_code$, $x_{i4}$ is $sex\_code$, $x_{i5}$ is the interaction effect of $age$ and $party\_code$, $x_{i6}$ is the interaction between $sex\_code$ and $party\_cd$, and $x_{i7}$ is $party\_cd$.
+
+$$ \gamma_{0j}, \gamma_{1j} \hspace {1mm}{\sim} \hspace {1mm} N_2(0, \Sigma)  $$
+
+The model results obtained are as shown below:
+
+```{r echo=FALSE,  message=FALSE, warning=FALSE, fig.align='center', results='asis', fig.height=5, fig.width=8}
+cat("\\begin{center}")
+stargazer(model2,header=FALSE,float=FALSE,single.row = TRUE, no.space = TRUE, column.sep.width = "3pt",font.size = "small")
+cat("\\end{center}")
+```
+
+In this model, age group 18 - 25 year olds, the Constitution Party, the Asian race, the Hispanic/Latino ethnicity and the female sex are used as baseline factors that are absorbed into the intercept, for ease of interpretation of the impact of these predictors in voter turnouts. All the predictors and the interaction terms are categorical, and a total of 44 distinct factors can be seen in the final model. We observe that the fixed effects of the model are significant at the 5% level. The largest z-values can be observed for $race\_code$, $ethnic\_code$ and $age$, signifying that these factors are the strongest predictors of whether a person if likely to turn up to vote in the elections.
+
+```{r echo=FALSE,  message=FALSE, warning=FALSE, fig.align='center', results='asis', fig.height=5, fig.width=8}
+dotplot(ranef(model2, condVar=TRUE))
+```
+
+From the dotplot of the random effects above, we observe that introducing the random slope effect of party shows that the log odds of a person voting across different counties differs greatly by the party they are affiliated to. Counties like Alexander, Cabarrus, Orange and Union have odds of voting which are significantly different than zero. People voting for the Green Party have highly varying odds, but this can also be attributed to the lower number of observations recorded against this party. Although the plot confirms that parties account for a lot of the variance in the voting odds we see across counties, it still does not explain all the variation in the model.
+
+## __Conclusion__
+The answers to our questions of interest are: 
+
+- The odds of turnout for males is 1.06 times compared to females, which is six percent higher. However, it is not statistically significant. The odds of turnout for age group 41 to 65 is found to be the highest, which is 2.7 times compared to the age group 18 to 25. With respect to race, when the Asian race is set as the baseline, the odds of turnout for Pacific Islanders, Undesignated, and White have higher odds of turnout. However, there are very few observations for Pacific Islanders. With respect to ethnic groups, when the Hispanic/Latino category is set as the baseline, the non-hispanic/non-latino category have higher odds of turnout. 
+
+- The odds of voting differ by county in 2020 from our EDA, so we added varying intercepts by county in our model. Further, we also observed changes in trends when checking if there is an interaction between party and county. Thus, varying slopes by county were also added to the model. In this case, the varying intercept in our model is 0, but if we select a party, say Democrat, Wake county has the highest odds of turnout, while Randolph and Mcdowell have the lowest ones.
+
+- Observing the interaction between age and party, there are many factors that are statistically significant. One of the interpretations for these combinations is that the odds of turnout for age group 26 to 40 who vote for Democrats is 2.03 times, increasing by 103%, compared to the age group 18 to 25 who vote for CST. 
+
+Besides the above questions of interest, we further dive into the voters' age groups and investigate which age group has a higher impact on the actual turnouts between Democrats and Republicans. Observing the interaction between age and party, the 26 to 40 age group is the only statistically significant factor compared with the two other age groups, with age group 18 to 25 as the baseline. Then, we further calculate the odds of turnout between the Democrats and Republicans for this age group, and we observe that the turnouts for Republicans is higher than for Democrats, with odds of turnout observed at 2.41 for the former and 2.05 for the latter when the baseline is the age group of 18 to 25 voting for CST. Another possible explanation behind this might also be the fact that Democrats and Republicans are the two biggest parties, and hence, many observations are available against these parties, compared to the Constitution and Green parties.
+
+### Limitations
+
+One limitation of this analysis is that, the NCSBE does not provide the exact difference between the variables $party\_cd$ and $voted\_party\_cd$ in the actual voter turnouts file. If voters changed their party affiliation at the time of casting their votes, this information is not captured in the dataset, and would not tally with the registered voter numbers. In addition, a random effect model with a varying slope and a varying intercept leads to very complicated interpretations of the model parameters. Since the data is grouped at a combination of different demographics, which makes it granular, we observe that not all groupings have enough observations recorded against them to fit a model on. Certain categories could be aggregated out so that there are sufficient observations against each grouping.
